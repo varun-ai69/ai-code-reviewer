@@ -1,0 +1,126 @@
+import os
+import json
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional
+from groq import Groq
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '../backend/.env'))
+
+app = FastAPI(title="RepoSage AI Engine", description="FastAPI microservice for repository analysis and documentation generation")
+
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize Groq client
+api_key = os.getenv("VITE_GROQ_API_KEY")
+groq_client = None
+
+if api_key:
+    try:
+        groq_client = Groq(api_key=api_key)
+        print("🟢 Groq Client successfully initialized in FastAPI AI Engine!")
+    except Exception as e:
+        print(f"⚠️ Error initializing Groq client: {e}")
+else:
+    print("⚠️ VITE_GROQ_API_KEY not found in environment. Running in sandbox mode.")
+
+# Data Models
+class FileItem(BaseModel):
+    name: str
+    content: str
+
+class AnalyzeRequest(BaseModel):
+    files: List[FileItem]
+    company: Optional[str] = "General"
+    language: Optional[str] = "English"
+
+# 🟢 Route: Root Check
+@app.get("/")
+def read_root():
+    return {"status": "online", "model": "llama-3.3-70b-versatile via Groq"}
+
+# 🟢 Route: Analyze Code Files and Generate Reviews & README
+@app.post("/analyze")
+async def analyze_repository(request: AnalyzeRequest):
+    if not groq_client:
+        raise HTTPException(status_code=500, detail="Groq API client is not configured on this engine.")
+    
+    files = request.files
+    company = request.company
+    language = request.language
+    
+    # 1. Structure the files representation for the prompt
+    repo_structure = []
+    file_contents_summary = []
+    
+    for f in files[:20]:  # Limit to first 20 source files to fit context limits
+        repo_structure.append(f.name)
+        file_contents_summary.append(f"--- File: {f.name} ---\n{f.content[:1500]}") # Truncate large files
+        
+    structure_text = "\n".join(repo_structure)
+    contents_text = "\n\n".join(file_contents_summary)
+
+    # 2. Call Groq to run Code Review
+    review_prompt = f"""You are a senior staff engineer and security analyst conducting a thorough code review.
+Target Company Persona: {company}
+Response Language: {language}
+
+Review this repository codebase. Find logical bugs, security threats (API leaks, hardcoded credentials, SQL injection), naming/style issues, and performance optimization opportunities.
+
+Here is the repository structure:
+{structure_text}
+
+Here is the contents of files:
+{contents_text}
+
+You MUST reply ONLY in a valid JSON format. Do not write markdown wrapping, do not write explanations before or after.
+Format your JSON precisely as:
+{{
+  "fileReviews": {{
+    "file_path_1": {{
+      "bugs": [
+        {{ "type": "bug name", "line": 12, "description": "...", "suggestion": "..." }}
+      ],
+      "security": [
+        {{ "type": "threat type", "line": 4, "description": "...", "suggestion": "..." }}
+      ],
+      "optimization": [
+        {{ "type": "slow code", "line": 20, "description": "...", "suggestion": "..." }}
+      ],
+      "styling": [
+        {{ "type": "convention issue", "line": 15, "description": "...", "suggestion": "..." }}
+      ]
+    }}
+  }},
+  "generatedReadme": "Write a highly detailed, professional README.md markdown for the entire repository, outlining installation, folder structure, features, tech stack, and usage guidelines."
+}}"""
+
+    try:
+      completion = groq_client.chat.completions.create(
+          model="llama-3.3-70b-versatile",
+          messages=[{"role": "user", "content": review_prompt}],
+          temperature=0.3,
+          response_format={"type": "json_object"}
+      )
+      
+      response_content = completion.choices[0].message.content
+      result = json.loads(response_content)
+      return result
+      
+    except Exception as e:
+      print(f"❌ Groq API Call Failed: {e}")
+      raise HTTPException(status_code=500, detail=f"Groq API reasoning failed: {str(e)}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
