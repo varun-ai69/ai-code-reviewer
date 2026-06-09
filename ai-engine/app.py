@@ -7,8 +7,21 @@ from typing import List, Optional
 from groq import Groq
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '../backend/.env'))
+# Load environment variables: prefer local .env, fall back to backend/.env
+env_paths = [
+    os.path.join(os.path.dirname(__file__), '.env'),
+    os.path.join(os.path.dirname(__file__), '../backend/.env'),
+]
+loaded = False
+for env_path in env_paths:
+    abs_path = os.path.abspath(env_path)
+    if os.path.isfile(abs_path):
+        load_dotenv(dotenv_path=abs_path)
+        loaded = True
+        print(f"📄 Loaded environment from {abs_path}")
+        break
+if not loaded:
+    print("⚠️ No .env file found. Running with existing environment variables.")
 
 app = FastAPI(title="RepoSage AI Engine", description="FastAPI microservice for repository analysis and documentation generation")
 
