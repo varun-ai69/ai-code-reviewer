@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import DOMPurify from 'dompurify';
 import SettingsModal from "./components/SettingsModal";
 import RepositoryOverview from './RepositoryOverview';
 import {
@@ -34,7 +35,7 @@ try {
   mermaid.initialize({
     startOnLoad: false,
     theme: "dark",
-    securityLevel: "loose",
+    securityLevel: "strict",
     themeVariables: {
       background: "#0f172a",
       primaryColor: "#3b82f6",
@@ -228,9 +229,10 @@ function MermaidViewer({ chart, repoName }: MermaidViewerProps) {
           width: "100%",
         }}
         dangerouslySetInnerHTML={{
-          __html:
+          __html: DOMPurify.sanitize(
             svg ||
-            '<span style="color:#9ca3af;font-size:12px;">Generating visual flowchart...</span>',
+            '<span style="color:#9ca3af;font-size:12px;">Generating visual flowchart...</span>'
+          ),
         }}
       />
     </div>
