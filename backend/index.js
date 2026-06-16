@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import PDFDocument from 'pdfkit';
 import crypto from 'crypto';
 import dotenv from 'dotenv';
 import path from 'path';

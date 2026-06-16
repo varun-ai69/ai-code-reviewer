@@ -83,8 +83,6 @@ export function scanSecrets(fileContent) {
 }
 
 export function scanSecretsInChanges(changes) {
-  const findings = [];
-  for (const change of changes) {
   if (!Array.isArray(changes)) return [];
   const findings = [];
   for (const change of changes) {
