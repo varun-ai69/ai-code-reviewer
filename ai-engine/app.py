@@ -485,6 +485,36 @@ If no issues are found, reply with an empty array: []"""
             
     return {"comments": comments}
 
+class SplitRequest(BaseModel):
+    files: List[FileItem]
+    chunk_size: Optional[int] = None
+    chunk_overlap: Optional[int] = None
+
+
+class SplitResponse(BaseModel):
+    chunks: List[dict]
+    total_chunks: int
+    total_files: int
+
+
+# 🟢 Route: Split files into text chunks for RAG ingestion
+@app.post("/api/rag/split", response_model=SplitResponse)
+async def split_files_for_rag(request: SplitRequest):
+    from text_splitter import split_files as do_split
+
+    file_dicts = [{"name": f.name, "content": f.content} for f in request.files]
+    chunks = do_split(
+        file_dicts,
+        chunk_size=request.chunk_size,
+        chunk_overlap=request.chunk_overlap,
+    )
+    return SplitResponse(
+        chunks=chunks,
+        total_chunks=len(chunks),
+        total_files=len(request.files),
+    )
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
