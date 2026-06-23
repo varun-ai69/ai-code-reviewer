@@ -118,13 +118,19 @@ def validate_system_prompt(prompt: str, max_len: int = 2000) -> str:
     return truncated
 app = FastAPI(title="RepoSage AI Engine", description="FastAPI microservice for repository analysis and documentation generation")
 
-# Enable CORS
+# Restrict CORS to configured origins so the AI engine is not accessible from
+# arbitrary third-party websites. Defaults to the local backend service address.
+# Set ALLOWED_ORIGINS in .env as a comma-separated list, e.g.:
+#   ALLOWED_ORIGINS=http://localhost:5000,http://localhost:3000
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5000")
+allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
 # Initialize Groq client (supports GROQ_API_KEY and legacy VITE_GROQ_API_KEY)
