@@ -162,9 +162,12 @@ function cleanupTimers() {
 
 // 🟢 Route: GitHub Import & AI Review
 app.post('/api/analyze', requireApiKey, analyzeLimiter, async (req, res) => {
-  const { repoUrl, company = 'General', language = 'English', model = 'llama-3.3-70b-versatile',temperature = 0.7,
+  let { repoUrl, company = 'General', language = 'English', model = 'llama-3.3-70b-versatile',temperature = 0.7,
      maxTokens = 2048, systemPrompt = '', batchSize = 5
    } = req.body;
+
+  // Enforce boundary limits for batchSize to prevent downstream parsing crashes
+  batchSize = Math.max(1, Math.min(20, parseInt(batchSize, 10) || 5));
 
   if (!repoUrl) {
     return res.status(400).json({ error: 'GitHub Repository URL is required.' });
