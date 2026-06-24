@@ -41,9 +41,16 @@ def _detect_language(file_name: str) -> str:
 def _make_splitter(file_name: str, chunk_size: Optional[int] = None, chunk_overlap: Optional[int] = None) -> RecursiveCharacterTextSplitter:
     language = _detect_language(file_name)
     separators = _language_separators.get(language, _language_separators["default"])
+    
+    final_chunk_size = chunk_size if chunk_size is not None else _CHUNK_SIZE
+    final_chunk_overlap = chunk_overlap if chunk_overlap is not None else _CHUNK_OVERLAP
+    
+    if final_chunk_overlap >= final_chunk_size:
+        final_chunk_overlap = max(0, final_chunk_size - 1)
+        
     return RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size or _CHUNK_SIZE,
-        chunk_overlap=chunk_overlap or _CHUNK_OVERLAP,
+        chunk_size=final_chunk_size,
+        chunk_overlap=final_chunk_overlap,
         separators=separators,
         length_function=len,
     )
@@ -113,9 +120,11 @@ def split_files(
 ) -> list[dict]:
     all_chunks = []
     for file in files:
+        if not file.get("name") or not file.get("content"):
+            continue
         chunks = split_file_content(
-            file_name=file.get("name", ""),
-            content=file.get("content", ""),
+            file_name=file["name"],
+            content=file["content"],
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             repo_url=repo_url,

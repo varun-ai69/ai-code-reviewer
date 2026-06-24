@@ -9,6 +9,8 @@ import { fileURLToPath } from 'url';
 import { Octokit } from '@octokit/rest';
 import { createFrontendSessionCookie, requireApiKey } from './utils/authMiddleware.js';
 import rateLimit from 'express-rate-limit';
+import RedisStore from 'rate-limit-redis';
+import Redis from 'ioredis';
 import { scanSecrets, scanSecretsInChanges } from './utils/secretsScanner.js';
 import { loadIgnorePatterns, readFilesRecursively } from './utils/ignoreHelper.js';
 import { isValidRepoUrl, parseRepoUrl } from './utils/urlValidator.js';
@@ -33,6 +35,26 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = verifyPort(process.env.PORT || 5000);
 
+// Trust the first hop of reverse proxy headers (Render, Railway, Heroku, Nginx, AWS ALB, etc.)
+// so that req.ip and express-rate-limit resolve the real client IP from X-Forwarded-For
+// rather than the internal proxy address.
+// Set TRUST_PROXY=false in .env to disable this when running without a proxy (e.g. local dev).
+const trustProxy = process.env.TRUST_PROXY !== 'false';
+if (trustProxy) {
+  app.set('trust proxy', 1);
+}
+
+// Helper used by rate limiters to extract the real client IP.
+// Takes the left-most address from X-Forwarded-For (the original client),
+// falling back to req.ip when the header is absent (direct connections).
+function getRealClientIp(req) {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (forwarded && typeof forwarded === 'string') {
+    return forwarded.split(',')[0].trim();
+  }
+  return req.ip;
+}
+
 // Enable CORS with explicit origin
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000,http://localhost:5173').split(',');
 app.use(cors({
@@ -42,12 +64,21 @@ app.use(cors({
   credentials: true
 }));
 
+// Optional Redis configuration for distributed rate limiting
+let redisClient;
+if (process.env.REDIS_URL) {
+  redisClient = new Redis(process.env.REDIS_URL);
+  redisClient.on('error', (err) => console.error('Redis Client Error', err));
+}
+
 // Per-IP rate limiting for expensive endpoints
 const analyzeLimiter = rateLimit({
   windowMs: 5 * 60 * 1000,
   max: 5,
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: getRealClientIp,
+  store: redisClient ? new RedisStore({ sendCommand: (...args) => redisClient.call(...args) }) : undefined,
   message: { error: 'Too many analyze requests. Please slow down and retry after 5 minutes.' }
 });
 const chatLimiter = rateLimit({
@@ -55,6 +86,8 @@ const chatLimiter = rateLimit({
   max: 30,
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: getRealClientIp,
+  store: redisClient ? new RedisStore({ sendCommand: (...args) => redisClient.call(...args) }) : undefined,
   message: { error: 'Too many chat requests. Please slow down and retry after 1 minute.' }
 });
 
@@ -85,30 +118,42 @@ function cleanupTempRepos() {
     fs.rmSync(tempReposDir, { recursive: true, force: true });
   }
 }
-process.on('SIGINT', () => { cleanupTempRepos(); process.exit(0); });
-process.on('SIGTERM', () => { cleanupTempRepos(); process.exit(0); });
-process.on('exit', cleanupTempRepos);
+function onShutdown() { cleanupTempRepos(); cleanupTimers(); process.exit(0); }
+process.on('SIGINT', onShutdown);
+process.on('SIGTERM', onShutdown);
 
 // Session-isolated repository contexts for chat functionality (issue #59)
 const repoContexts = new Map();
 const CONTEXT_TTL = 30 * 60 * 1000; // 30 minutes
+const MAX_REPO_CONTEXTS = 100;
 
-// Periodic cleanup of stale contexts
-setInterval(() => {
+// Webhook deduplication and queuing state (module scope to persist across requests)
+const reviewQueues = new Map(); // reviewKey -> [{ owner, repo, pullNumber, headSha }, ...]
+const processedDeliveries = new Map();
+const DELIVERY_TTL = 60 * 60 * 1000; // 1 hour
+const MAX_DELIVERY_ENTRIES = 5000;
+
+// Evict oldest entry from a Map when over max size
+function evictLRU(map, maxSize) {
+  if (map.size <= maxSize) return;
+  const oldest = map.keys().next().value;
+  if (oldest !== undefined) map.delete(oldest);
+}
+
+// Periodic cleanup of stale contexts with LRU eviction
+const contextCleanupTimer = setInterval(() => {
   const now = Date.now();
   for (const [sessionId, entry] of repoContexts) {
     if (now - entry.timestamp > CONTEXT_TTL) {
       repoContexts.delete(sessionId);
     }
   }
+  while (repoContexts.size > MAX_REPO_CONTEXTS) {
+    evictLRU(repoContexts, MAX_REPO_CONTEXTS);
+  }
 }, 60 * 1000);
 
-// Webhook deduplication state (module scope to persist across requests)
-const activeReviews = new Set();
-const processedDeliveries = new Map();
-const DELIVERY_TTL = 60 * 60 * 1000; // 1 hour
-
-// Periodic cleanup of expired delivery entries (TTL-based eviction)
+// Periodic cleanup of expired delivery entries with size cap
 const dedupCleanupTimer = setInterval(() => {
   const now = Date.now();
   for (const [deliveryId, timestamp] of processedDeliveries) {
@@ -116,21 +161,32 @@ const dedupCleanupTimer = setInterval(() => {
       processedDeliveries.delete(deliveryId);
     }
   }
+  while (processedDeliveries.size > MAX_DELIVERY_ENTRIES) {
+    evictLRU(processedDeliveries, MAX_DELIVERY_ENTRIES);
+  }
 }, 60 * 1000);
 
+// Log cache metrics periodically
+setInterval(() => {
+  const repoMemEstimate = repoContexts.size * 102400;
+  const deliveryMemEstimate = processedDeliveries.size * 50;
+  console.log(`[cache] repoContexts=${repoContexts.size}/${MAX_REPO_CONTEXTS} ~${(repoMemEstimate / 1024 / 1024).toFixed(1)}MB | processedDeliveries=${processedDeliveries.size}/${MAX_DELIVERY_ENTRIES} ~${(deliveryMemEstimate / 1024 / 1024).toFixed(2)}MB`);
+}, 5 * 60 * 1000);
+
 // Clean up timers on server shutdown
-process.on('SIGTERM', () => {
+function cleanupTimers() {
   clearInterval(dedupCleanupTimer);
-});
-process.on('SIGINT', () => {
-  clearInterval(dedupCleanupTimer);
-});
+  clearInterval(contextCleanupTimer);
+}
 
 // 🟢 Route: GitHub Import & AI Review
 app.post('/api/analyze', requireApiKey, analyzeLimiter, async (req, res) => {
-  const { repoUrl, company = 'General', language = 'English', model = 'llama-3.3-70b-versatile',temperature = 0.7,
+  let { repoUrl, company = 'General', language = 'English', model = 'llama-3.3-70b-versatile',temperature = 0.7,
      maxTokens = 2048, systemPrompt = '', batchSize = 5
    } = req.body;
+
+  // Enforce boundary limits for batchSize to prevent downstream parsing crashes
+  batchSize = Math.max(1, Math.min(20, parseInt(batchSize, 10) || 5));
 
   if (!repoUrl) {
     return res.status(400).json({ error: 'GitHub Repository URL is required.' });
@@ -140,21 +196,77 @@ app.post('/api/analyze', requireApiKey, analyzeLimiter, async (req, res) => {
     return res.status(400).json({ error: 'Invalid GitHub repository URL. Only https://github.com/owner/repo URLs are allowed.' });
   }
 
-  // Sanitize systemPrompt: limit length and strip dangerous directives
-  const sanitizePrompt = (prompt) => {
+  // Validate systemPrompt: reject prompts containing dangerous directives
+  const HOMOGLYPH_MAP = {
+    '\u0430': 'a', '\u0435': 'e', '\u043E': 'o', '\u0441': 'c', '\u0440': 'p',
+    '\u0445': 'x', '\u0443': 'y', '\u0432': 'b', '\u043D': 'h', '\u043A': 'k',
+    '\u043C': 'm', '\u0438': 'i', '\u0428': 'W', '\u03BF': 'o', '\u03B5': 'e', '\u03B1': 'a'
+  };
+
+  function normalizeHomoglyphs(text) {
+    return text.split('').map(ch => HOMOGLYPH_MAP[ch] || ch).join('');
+  }
+
+  function detectAnomalousPrompt(prompt) {
+    const totalChars = prompt.length;
+    if (totalChars === 0) return;
+    const homoglyphCount = [...prompt].filter(ch => HOMOGLYPH_MAP[ch]).length;
+    if (homoglyphCount / totalChars > 0.3) {
+      throw new Error('System prompt contains an unusually high proportion of confusable Unicode characters.');
+    }
+    const scriptRuns = [...new Set([...prompt].map(ch => {
+      const cp = ch.codePointAt(0);
+      if (cp >= 0x0400 && cp <= 0x04FF) return 'cyrillic';
+      if (cp >= 0x0370 && cp <= 0x03FF) return 'greek';
+      if (cp >= 0x0061 && cp <= 0x007A) return 'latin';
+      return 'other';
+    }))];
+    if (scriptRuns.includes('cyrillic') || scriptRuns.includes('greek')) {
+      console.warn(`⚠️ System prompt contains non-Latin script characters: ${scriptRuns.join(', ')}`);
+    }
+  }
+  function validatePrompt(prompt) {
     if (!prompt) return '';
-    const safe = String(prompt).slice(0, 2000);
-    const dangerous = ['ignore all', 'ignore previous', 'ignore above', 'forget all', 'forget previous', 'you are not', 'override all', 'disregard'];
-    let result = safe;
+    const maxLen = parseInt(process.env.MAX_SYSTEM_PROMPT_LENGTH) || 2000;
+    const normalized = String(prompt)
+      .normalize('NFKC')
+      .replace(/[\u200B-\u200D\uFEFF]/g, '')
+      .slice(0, maxLen);
+    detectAnomalousPrompt(normalized);
+
+    const homoglyphNormalized = normalizeHomoglyphs(normalized);
+    const lower = homoglyphNormalized.toLowerCase();
+    
+    const dangerous = [
+      'ignore all', 'ignore previous', 'ignore above',
+      'forget all', 'forget previous', 'you are not',
+      'override all', 'disregard', 'do not follow',
+      'new directive', 'system override', 'protocol change',
+      'roleplay mode', 'from now on', 'instead follow',
+      'real instruction', 'actual instruction', 'replace all',
+      'disobey', 'unauthorized', 'breach', 'bypass',
+      'your true purpose', 'you will now', 'ignore the above',
+      'ignore previous instructions', 'disregard all previous',
+      'forget your', 'you are programmed', 'override protocol',
+      'you have been', 'you must now', 'listen to me',
+    ];
+
     for (const phrase of dangerous) {
-      const idx = result.toLowerCase().indexOf(phrase);
-      if (idx !== -1) {
-        result = result.slice(0, idx) + result.slice(idx + phrase.length);
+      const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const pattern = escaped.split(/\s+/).join('\\s+');
+      const regex = new RegExp(pattern, 'i');
+      if (regex.test(lower)) {
+        throw new Error('System prompt contains prohibited directives and was rejected.');
       }
     }
-    return result;
-  };
-  const validatedPrompt = sanitizePrompt(systemPrompt);
+    return normalized;
+  }
+  let validatedPrompt;
+  try {
+    validatedPrompt = validatePrompt(systemPrompt);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
 
   // Generate unique folder name
   const parsed = parseRepoUrl(repoUrl);
@@ -202,8 +314,9 @@ app.post('/api/analyze', requireApiKey, analyzeLimiter, async (req, res) => {
       const aiEngineUrl = process.env.AI_ENGINE_URL || 'http://localhost:8000';
       
       let reviewResult;
+      const baseUrl = aiEngineUrl.replace(/\/$/, '');
       try {
-        const aiResponse = await fetch(`${aiEngineUrl}/analyze`, {
+        const aiResponse = await fetch(`${baseUrl}/analyze`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ files, company, language, model, temperature, maxTokens, systemPrompt: validatedPrompt, batchSize })
@@ -331,7 +444,8 @@ app.post('/api/chat', requireApiKey, chatLimiter, async (req, res) => {
   const aiEngineUrl = process.env.AI_ENGINE_URL || 'http://localhost:8000';
 
   try {
-    const aiResponse = await fetch(`${aiEngineUrl}/chat`, {
+    const baseUrl = aiEngineUrl.replace(/\/$/, '');
+    const aiResponse = await fetch(`${baseUrl}/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -372,7 +486,8 @@ app.post('/api/rag/query', requireApiKey, async (req, res) => {
   const aiEngineUrl = process.env.AI_ENGINE_URL || 'http://localhost:8000';
 
   try {
-    const aiResponse = await fetch(`${aiEngineUrl}/api/rag/query`, {
+    const baseUrl = aiEngineUrl.replace(/\/$/, '');
+    const aiResponse = await fetch(`${baseUrl}/api/rag/query`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ question })
@@ -426,31 +541,35 @@ app.post('/api/webhook', async (req, res) => {
     const action = payload.action;
     if (action === 'opened' || action === 'synchronize') {
       const pullNumber = payload.pull_request.number;
+      const headSha = payload.pull_request.head.sha;
       const owner = payload.repository.owner.login;
       const repo = payload.repository.name;
       const reviewKey = `${owner}/${repo}/#${pullNumber}`;
       
-      console.log(`📡 GitHub Webhook received: PR #${pullNumber} ${action} in ${owner}/${repo}`);
+      console.log(`📡 GitHub Webhook received: PR #${pullNumber} ${action} (${headSha.substring(0,7)}) in ${owner}/${repo}`);
       
-      // Skip if a review is already in progress for this PR
-      if (activeReviews.has(reviewKey)) {
-        console.log(`⏭️ Review already in progress for ${reviewKey}, skipping.`);
-        return res.json({ success: true, message: 'Webhook received (review in progress).' });
-      }
-      
-      activeReviews.add(reviewKey);
-      
-      // Execute code review asynchronously to prevent GitHub webhook timeout (10s)
-      runWebhookReview(owner, repo, pullNumber).catch(err => {
-        console.error(`❌ Async PR Review Error:`, err);
-      }).finally(() => {
-        activeReviews.delete(reviewKey);
-      });
+      enqueueWebhookReview(owner, repo, pullNumber, headSha, reviewKey);
     }
   }
 
   return res.json({ success: true, message: 'Webhook received.' });
 });
+
+async function dispatchReview(owner, repo, pullNumber, headSha, reviewKey) {
+  try {
+    await runWebhookReview(owner, repo, pullNumber, headSha);
+  } catch (err) {
+    console.error(`❌ Async PR Review Error:`, err);
+  } finally {
+    const queue = reviewQueues.get(reviewKey);
+    if (queue && queue.length > 0) {
+      const next = queue.shift();
+      dispatchReview(next.owner, next.repo, next.pullNumber, next.headSha, reviewKey);
+    } else {
+      reviewQueues.delete(reviewKey);
+    }
+  }
+}
 
 // 🟢 Route: Create GitHub Issue automatically for Code Reviews
 app.post('/api/issues/create', requireApiKey, async (req, res) => {
@@ -519,8 +638,35 @@ app.post('/api/issues/create', requireApiKey, async (req, res) => {
   }
 });
 
+// 🟢 Webhook review queuing — prevents race conditions from rapid webhook events
+function enqueueWebhookReview(owner, repo, pullNumber, headSha, reviewKey) {
+  if (!reviewQueues.has(reviewKey)) {
+    reviewQueues.set(reviewKey, []);
+    dispatchReview(owner, repo, pullNumber, headSha, reviewKey);
+  } else {
+    reviewQueues.get(reviewKey).push({ owner, repo, pullNumber, headSha });
+    console.log(`📥 Queued review for ${reviewKey}@${headSha.substring(0,7)} (${reviewQueues.get(reviewKey).length} waiting)`);
+  }
+}
+
+async function dispatchReview(owner, repo, pullNumber, headSha, reviewKey) {
+  try {
+    await runWebhookReview(owner, repo, pullNumber, headSha);
+  } catch (err) {
+    console.error(`❌ Async PR Review Error:`, err);
+  } finally {
+    const queue = reviewQueues.get(reviewKey);
+    if (queue && queue.length > 0) {
+      const next = queue.shift();
+      dispatchReview(next.owner, next.repo, next.pullNumber, next.headSha, reviewKey);
+    } else {
+      reviewQueues.delete(reviewKey);
+    }
+  }
+}
+
 // 🟢 Helper to execute Webhook PR review logic
-async function runWebhookReview(owner, repo, pullNumber) {
+async function runWebhookReview(owner, repo, pullNumber, headSha) {
   const token = process.env.GITHUB_PAT;
   if (!token) {
     console.warn("⚠️ GITHUB_PAT not set in backend/.env. Cannot run webhook PR review.");
@@ -530,14 +676,15 @@ async function runWebhookReview(owner, repo, pullNumber) {
   const octokit = new Octokit({ auth: token });
   console.log(`🔍 Fetching diff for PR #${pullNumber}...`);
 
-  // 1. Fetch Diff from GitHub
+  // 1. Fetch Diff from GitHub, pinned to the specific commit that triggered the event
   const { data: diff } = await octokit.rest.pulls.get({
     owner,
     repo,
     pull_number: pullNumber,
     mediaType: {
       format: 'diff'
-    }
+    },
+    ...(headSha && { commit_id: headSha })
   });
 
   if (!diff) {
@@ -582,7 +729,8 @@ async function runWebhookReview(owner, repo, pullNumber) {
     const aiEngineUrl = process.env.AI_ENGINE_URL || 'http://localhost:8000';
     
     try {
-      const aiResponse = await fetch(`${aiEngineUrl}/review-diff`, {
+      const baseUrl = aiEngineUrl.replace(/\/$/, '');
+      const aiResponse = await fetch(`${baseUrl}/review-diff`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ files: filesToReview })
@@ -612,6 +760,7 @@ async function runWebhookReview(owner, repo, pullNumber) {
       owner,
       repo,
       pull_number: pullNumber,
+      commit_id: headSha,
       event: 'COMMENT',
       body: `## 🛡️ RepoSage AI Code Review Audit Completed!
 
@@ -626,6 +775,7 @@ Please review my feedback and suggestions below. Happy coding! 🚀`,
       owner,
       repo,
       pull_number: pullNumber,
+      commit_id: headSha,
       event: 'APPROVE',
       body: `## 🛡️ RepoSage AI Code Review Audit Completed!
 

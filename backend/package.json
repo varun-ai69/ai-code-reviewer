@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "test": "node tests/run-tests.js"
+    "test": "c8 --reporter=lcov --reporter=text node tests/run-tests.js"
   },
   "dependencies": {
     "@octokit/rest": "^22.0.1",
@@ -15,12 +15,15 @@
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "express-rate-limit": "^8.5.2",
+    "ioredis": "^5.3.2",
     "lodash.escape": "^4.0.1",
     "mongoose": "^9.7.1",
     "pdfkit": "^0.19.0",
+    "rate-limit-redis": "^4.2.0",
     "simple-git": "^3.27.0"
   },
   "devDependencies": {
+    "c8": "^11.0.0",
     "nodemon": "^3.1.9"
   }
 }

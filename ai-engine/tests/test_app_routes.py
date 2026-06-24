@@ -1,10 +1,10 @@
 # Mock heavy dependencies before importing app
 import sys
-from unittest.mock import MagicMock
-sys.modules['sentence_transformers'] = MagicMock()
-sys.modules['groq'] = MagicMock()
-sys.modules['chromadb'] = MagicMock()
-sys.modules['chromadb.config'] = MagicMock()
+from unittest.mock import MagicMock, patch
+
+
+# We removed the global mocks for vectorstore, rag, text_splitter 
+# because they leak into other test files like test_vectorstore.py
 
 import pytest
 from fastapi.testclient import TestClient
@@ -83,3 +83,122 @@ class TestAnalyzeRequestValidation:
         }
         response = client.post("/analyze", json=payload)
         assert response.status_code == 500
+
+
+class TestRagCleanupVectors:
+    @patch('vectorstore.cleanup_stale_vectors')
+    def test_cleanup_vectors_returns_stale_paths(self, mock_cleanup):
+        mock_cleanup.return_value = {
+            "stale_paths": ["deleted.py"],
+            "removed_count": 1,
+            "remaining_count": 2,
+        }
+        payload = {"current_files": ["keep.py"]}
+        response = client.post("/api/rag/cleanup", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert "stale_paths" in data
+        assert "removed_count" in data
+        assert "remaining_count" in data
+
+    @patch('vectorstore.cleanup_stale_vectors')
+    def test_cleanup_vectors_returns_empty_for_all_current(self, mock_cleanup):
+        mock_cleanup.return_value = {
+            "stale_paths": [],
+            "removed_count": 0,
+            "remaining_count": 3,
+        }
+        payload = {"current_files": ["a.py", "b.py", "c.py"]}
+        response = client.post("/api/rag/cleanup", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["removed_count"] == 0
+
+    @patch('vectorstore.cleanup_stale_vectors')
+    def test_cleanup_vectors_accepts_empty_list(self, mock_cleanup):
+        mock_cleanup.return_value = {
+            "stale_paths": ["old.py"],
+            "removed_count": 1,
+            "remaining_count": 0,
+        }
+        payload = {"current_files": []}
+        response = client.post("/api/rag/cleanup", json=payload)
+        assert response.status_code == 200
+
+
+class TestRagDeleteVectors:
+    @patch('vectorstore.delete_vectors_for_file')
+    def test_delete_vectors_returns_removed_count(self, mock_delete):
+        mock_delete.return_value = 3
+        payload = {"file_path": "src/deleted.py"}
+        response = client.post("/api/rag/delete-vectors", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["removed_count"] == 3
+        assert data["file_path"] == "src/deleted.py"
+
+    @patch('vectorstore.delete_vectors_for_file')
+    def test_delete_vectors_returns_zero_when_file_not_found(self, mock_delete):
+        mock_delete.return_value = 0
+        payload = {"file_path": "nonexistent.py"}
+        response = client.post("/api/rag/delete-vectors", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["removed_count"] == 0
+
+
+class TestRagSplitFiles:
+    @patch('text_splitter.split_files')
+    def test_split_files_returns_correct_chunks_and_files(self, mock_split):
+        mock_split.return_value = [
+            {"chunk_id": "abc123", "content": "def foo(): pass", "metadata": {"source_file": "a.py", "fileName": "a.py", "chunk_index": 0, "total_chunks": 1, "language": "python", "start_line": 0, "end_line": 0}},
+        ]
+        payload = {
+            "files": [{"name": "a.py", "content": "def foo(): pass"}],
+            "chunk_size": 500,
+            "chunk_overlap": 100,
+        }
+        response = client.post("/api/rag/split", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_chunks"] == 1
+        assert data["total_files"] == 1
+        assert len(data["chunks"]) == 1
+        assert data["chunks"][0]["chunk_id"] == "abc123"
+
+    @patch('text_splitter.split_files')
+    def test_split_files_empty_files_returns_zero_chunks(self, mock_split):
+        mock_split.return_value = []
+        payload = {"files": []}
+        response = client.post("/api/rag/split", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_chunks"] == 0
+        assert data["total_files"] == 0
+
+
+class TestRagQueryChunks:
+    @patch('rag.query_chunks')
+    def test_query_chunks_returns_chunks_list(self, mock_query):
+        mock_query.return_value = [
+            {"chunk_id": "c1", "content": "def main(): pass", "metadata": {"source_file": "main.py"}, "similarity_score": 0.95},
+            {"chunk_id": "c2", "content": "def foo(): pass", "metadata": {"source_file": "utils.py"}, "similarity_score": 0.87},
+        ]
+        payload = {"question": "What is the main function?"}
+        response = client.post("/api/rag/query", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert "chunks" in data
+        assert "total_chunks" in data
+        assert len(data["chunks"]) == 2
+        assert data["chunks"][0]["chunk_id"] == "c1"
+
+    @patch('rag.query_chunks')
+    def test_query_chunks_returns_empty_when_no_results(self, mock_query):
+        mock_query.return_value = []
+        payload = {"question": "nonexistent concept"}
+        response = client.post("/api/rag/query", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_chunks"] == 0
+        assert data["chunks"] == []

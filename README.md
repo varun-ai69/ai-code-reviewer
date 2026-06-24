@@ -6,6 +6,7 @@
 
 [![MIT License](https://img.shields.io/badge/License-MIT-green.svg?style=for-the-badge)](LICENSE)
 [![GSSoC '26](https://img.shields.io/badge/GSSoC%20'26-Contributor%20Program-orange?style=for-the-badge&logo=opensourceinitiative&logoColor=white)](https://gssoc.girlscript.tech/)
+[![codecov](https://img.shields.io/codecov/c/github/kalyan-1845/ai-code-reviewer?style=for-the-badge&logo=codecov)](https://codecov.io/gh/kalyan-1845/ai-code-reviewer)
 [![Node.js](https://img.shields.io/badge/Node.js-18+-339933?style=for-the-badge&logo=nodedotjs&logoColor=white)](https://nodejs.org/)
 [![React](https://img.shields.io/badge/React-19-61DAFB?style=for-the-badge&logo=react&logoColor=black)](https://react.dev/)
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org/)
