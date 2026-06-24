@@ -781,8 +781,17 @@ export default function Dashboard() {
       const updatedHistory = [
         entry,
         ...prev.filter(item => item.repoUrl !== repoUrl)
-      ].slice(0, 10);
-      localStorage.setItem('reposage_audit_history', JSON.stringify(updatedHistory));
+      ].slice(0, 5); // reduced to 5 to save space
+
+      try {
+        localStorage.setItem('reposage_audit_history', JSON.stringify(updatedHistory));
+      } catch (e: any) {
+        if (e instanceof DOMException && e.name === 'QuotaExceededError') {
+          console.warn('localStorage quota exceeded — audit history not saved.');
+        } else {
+          console.warn('Failed to save to localStorage:', e);
+        }
+      }
       return updatedHistory;
     });
   };
