@@ -201,7 +201,7 @@ class AnalyzeRequest(BaseModel):
     temperature: Optional[float] = 0.7
     maxTokens: Optional[int] = 2048
     systemPrompt: Optional[str] = ""
-    batchSize: Optional[int] = 5
+    batchSize: Optional[int] = Field(5, ge=1, le=20)
     
 
 class ChatRequest(BaseModel):
