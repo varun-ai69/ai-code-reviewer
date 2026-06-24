@@ -23,6 +23,7 @@ import { verifyWebhookSignature } from './utils/signatureVerifier.js';
 import { verifyPort } from './utils/envVerifier.js';
 import { mockAIReview } from './utils/mockAIReview.js';
 import Analytics from './models/Analytics.js';
+import Session from './models/Session.js';
 import { connectDatabase } from './config/db.js';
 
 dotenv.config();
@@ -122,10 +123,9 @@ function onShutdown() { cleanupTempRepos(); cleanupTimers(); process.exit(0); }
 process.on('SIGINT', onShutdown);
 process.on('SIGTERM', onShutdown);
 
-// Session-isolated repository contexts for chat functionality (issue #59)
-const repoContexts = new Map();
-const CONTEXT_TTL = 30 * 60 * 1000; // 30 minutes
-const MAX_REPO_CONTEXTS = 100;
+// Repository contexts for chat are now persisted in MongoDB via the Session model.
+// The Session collection uses a TTL index (expireAfterSeconds: 1800) so MongoDB
+// handles expiry automatically — no in-process Map or setInterval needed.
 
 // Webhook deduplication and queuing state (module scope to persist across requests)
 const reviewQueues = new Map(); // reviewKey -> [{ owner, repo, pullNumber, headSha }, ...]
@@ -139,19 +139,6 @@ function evictLRU(map, maxSize) {
   const oldest = map.keys().next().value;
   if (oldest !== undefined) map.delete(oldest);
 }
-
-// Periodic cleanup of stale contexts with LRU eviction
-const contextCleanupTimer = setInterval(() => {
-  const now = Date.now();
-  for (const [sessionId, entry] of repoContexts) {
-    if (now - entry.timestamp > CONTEXT_TTL) {
-      repoContexts.delete(sessionId);
-    }
-  }
-  while (repoContexts.size > MAX_REPO_CONTEXTS) {
-    evictLRU(repoContexts, MAX_REPO_CONTEXTS);
-  }
-}, 60 * 1000);
 
 // Periodic cleanup of expired delivery entries with size cap
 const dedupCleanupTimer = setInterval(() => {
@@ -167,16 +154,15 @@ const dedupCleanupTimer = setInterval(() => {
 }, 60 * 1000);
 
 // Log cache metrics periodically
-setInterval(() => {
-  const repoMemEstimate = repoContexts.size * 102400;
+const cacheMetricsTimer = setInterval(() => {
   const deliveryMemEstimate = processedDeliveries.size * 50;
-  console.log(`[cache] repoContexts=${repoContexts.size}/${MAX_REPO_CONTEXTS} ~${(repoMemEstimate / 1024 / 1024).toFixed(1)}MB | processedDeliveries=${processedDeliveries.size}/${MAX_DELIVERY_ENTRIES} ~${(deliveryMemEstimate / 1024 / 1024).toFixed(2)}MB`);
+  console.log(`[cache] processedDeliveries=${processedDeliveries.size}/${MAX_DELIVERY_ENTRIES} ~${(deliveryMemEstimate / 1024 / 1024).toFixed(2)}MB`);
 }, 5 * 60 * 1000);
 
 // Clean up timers on server shutdown
 function cleanupTimers() {
   clearInterval(dedupCleanupTimer);
-  clearInterval(contextCleanupTimer);
+  clearInterval(cacheMetricsTimer);
 }
 
 // 🟢 Route: GitHub Import & AI Review
@@ -363,14 +349,19 @@ app.post('/api/analyze', requireApiKey, analyzeLimiter, async (req, res) => {
         });
       }
 
-      // 3. Cache the repository context for chat with session isolation
+      // 3. Persist the repository context for chat in MongoDB so it survives
+      //    server restarts and works across multiple backend instances.
       const sessionId = crypto.randomUUID();
-      repoContexts.set(sessionId, {
-        repoUrl,
-        repoName,
-        files,
-        timestamp: Date.now()
-      });
+      try {
+        await Session.create({
+          sessionId,
+          repoUrl,
+          repoName,
+          files,
+        });
+      } catch (sessionErr) {
+        console.warn('⚠️ Failed to persist session context:', sessionErr.message);
+      }
 
       // 4. Compute and persist analytics
       let totalBugs = 0, totalSecurityIssues = 0, totalOptimizations = 0, totalStylingIssues = 0;
@@ -432,14 +423,23 @@ app.post('/api/chat', requireApiKey, chatLimiter, async (req, res) => {
     return res.status(400).json({ error: 'Message is required.' });
   }
 
-  const context = sessionId ? repoContexts.get(sessionId) : null;
-  if (!context) {
-    const hint = !sessionId ? 'sessionId is missing from the request' : 'session expired';
-    return res.status(400).json({ error: `No repository is currently active or ${hint}. Please analyze a repository first.` });
+  let context = null;
+  if (sessionId) {
+    try {
+      context = await Session.findOne({ sessionId });
+      if (context) {
+        // Refresh TTL by resetting createdAt so the 30-minute window restarts
+        await Session.updateOne({ sessionId }, { $set: { createdAt: new Date() } });
+      }
+    } catch (sessionErr) {
+      console.warn('⚠️ Failed to retrieve session from MongoDB:', sessionErr.message);
+    }
   }
 
-  // Refresh TTL on access
-  context.timestamp = Date.now();
+  if (!context) {
+    const hint = !sessionId ? 'sessionId is missing from the request' : 'session expired or not found';
+    return res.status(400).json({ error: `No repository is currently active or ${hint}. Please analyze a repository first.` });
+  }
 
   const aiEngineUrl = process.env.AI_ENGINE_URL || 'http://localhost:8000';
 
@@ -554,22 +554,6 @@ app.post('/api/webhook', async (req, res) => {
 
   return res.json({ success: true, message: 'Webhook received.' });
 });
-
-async function dispatchReview(owner, repo, pullNumber, headSha, reviewKey) {
-  try {
-    await runWebhookReview(owner, repo, pullNumber, headSha);
-  } catch (err) {
-    console.error(`❌ Async PR Review Error:`, err);
-  } finally {
-    const queue = reviewQueues.get(reviewKey);
-    if (queue && queue.length > 0) {
-      const next = queue.shift();
-      dispatchReview(next.owner, next.repo, next.pullNumber, next.headSha, reviewKey);
-    } else {
-      reviewQueues.delete(reviewKey);
-    }
-  }
-}
 
 // 🟢 Route: Create GitHub Issue automatically for Code Reviews
 app.post('/api/issues/create', requireApiKey, async (req, res) => {
