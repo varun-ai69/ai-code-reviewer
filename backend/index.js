@@ -46,16 +46,11 @@ if (trustProxy) {
   app.set('trust proxy', 1);
 }
 
-// Helper used by rate limiters to extract the real client IP.
-// Takes the left-most address from X-Forwarded-For (the original client),
-// falling back to req.ip when the header is absent (direct connections).
-function getRealClientIp(req) {
-  const forwarded = req.headers['x-forwarded-for'];
-  if (forwarded && typeof forwarded === 'string') {
-    return forwarded.split(',')[0].trim();
-  }
-  return req.ip;
-}
+// NOTE: No custom keyGenerator is needed. With `trust proxy: 1` set above, Express
+// automatically resolves req.ip to the real client IP by stripping the known proxy
+// hop from X-Forwarded-For. express-rate-limit defaults to req.ip, which is already
+// correct. A custom function that reads X-Forwarded-For directly would trust the
+// leftmost (client-controlled) value, allowing IP spoofing to bypass rate limits.
 
 // Enable CORS with explicit origin
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000,http://localhost:5173').split(',');
@@ -79,7 +74,9 @@ const analyzeLimiter = rateLimit({
   max: 5,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: getRealClientIp,
+  // No keyGenerator: express-rate-limit defaults to req.ip, which Express has already
+  // resolved correctly via the `trust proxy` setting above. Using req.ip prevents
+  // clients from bypassing the limit by rotating fake X-Forwarded-For values.
   store: redisClient ? new RedisStore({ sendCommand: (...args) => redisClient.call(...args) }) : undefined,
   message: { error: 'Too many analyze requests. Please slow down and retry after 5 minutes.' }
 });
@@ -88,7 +85,7 @@ const chatLimiter = rateLimit({
   max: 30,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: getRealClientIp,
+  // No keyGenerator: same rationale as analyzeLimiter above.
   store: redisClient ? new RedisStore({ sendCommand: (...args) => redisClient.call(...args) }) : undefined,
   message: { error: 'Too many chat requests. Please slow down and retry after 1 minute.' }
 });
