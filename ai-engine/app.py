@@ -272,8 +272,8 @@ class AnalyzeRequest(BaseModel):
     company: Optional[str] = "General"
     language: Optional[str] = "English"
     model: Optional[str] = "llama-3.3-70b-versatile"
-    temperature: Optional[float] = 0.7
-    maxTokens: Optional[int] = 2048
+    temperature: Optional[float] = Field(0.7, ge=0, le=2)
+    maxTokens: Optional[int] = Field(2048, ge=1, le=32768)
     systemPrompt: Optional[str] = ""
     batchSize: Optional[int] = Field(5, ge=1, le=20)
     
