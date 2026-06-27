@@ -502,65 +502,86 @@ app.post('/api/chat', requireApiKey, requireJsonContentType, chatLimiter, async 
     return res.status(400).json({ error: 'Message is required.' });
   }
 
-  let context = null;
+  // Verify session ownership before entering the queue (issue #742).
+  // Only the client that created the session may access it.
   if (sessionId) {
     try {
-      context = await Session.findOne({ sessionId });
-      if (context) {
-        // Verify session ownership to prevent IDOR (issue #742):
-        // only the client that created the session may access it.
-        if (context.ownerToken && context.ownerToken !== req.clientId) {
-          console.warn(`⚠️ IDOR attempt: client ${req.clientId} tried to access session ${sessionId} owned by ${context.ownerToken}`);
-          return res.status(403).json({ error: 'Access denied: this session does not belong to you.' });
-        }
-        // Update lastAccessedAt for activity tracking. createdAt remains
-        // unchanged so the original TTL (30 minutes from creation) is
-        // preserved, preventing indefinite session extension (see issue #672).
-        await Session.updateOne({ sessionId }, { $set: { lastAccessedAt: new Date() } });
+      const session = await Session.findOne({ sessionId });
+      if (session && session.ownerToken && session.ownerToken !== req.clientId) {
+        console.warn(`⚠️ IDOR attempt: client ${req.clientId} tried to access session ${sessionId} owned by ${session.ownerToken}`);
+        return res.status(403).json({ error: 'Access denied: this session does not belong to you.' });
       }
     } catch (sessionErr) {
       console.warn('⚠️ Failed to retrieve session from MongoDB:', sessionErr.message);
     }
   }
 
-  if (!context) {
-    const hint = !sessionId ? 'sessionId is missing from the request' : 'session expired or not found';
-    return res.status(400).json({ error: `No repository is currently active or ${hint}. Please analyze a repository first.` });
-  }
-
-  const aiEngineUrl = process.env.AI_ENGINE_URL || 'http://localhost:8000';
-
+  // Use reviewQueue to serialize requests per session, preventing
+  // lost-update race conditions when multiple messages arrive concurrently
+  // for the same session (see issue #746).
   try {
-    const baseUrl = aiEngineUrl.replace(/\/+$/, '');
-    const aiResponse = await fetchWithTimeout(`${baseUrl}/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        files: context.files,
-        message,
-        history,
-        model,
-        temperature,
-        maxTokens,
-        systemPrompt,
-        useRag,
-        repo_url: context.repoUrl
-      })
-    }, 30000);
+    await reviewQueue.runExclusive(sessionId || '__no_session__', async () => {
+      let context = null;
+      if (sessionId) {
+        try {
+          context = await Session.findOne({ sessionId });
+          if (context) {
+            // Update lastAccessedAt for activity tracking. createdAt remains
+            // unchanged so the original TTL (30 minutes from creation) is
+            // preserved, preventing indefinite session extension (see issue #672).
+            await Session.updateOne({ sessionId }, { $set: { lastAccessedAt: new Date() } });
+          }
+        } catch (sessionErr) {
+          console.warn('⚠️ Failed to retrieve session from MongoDB:', sessionErr.message);
+        }
+      }
 
-    if (aiResponse.ok) {
-      const data = await aiResponse.json();
-      return res.json(data);
-    } else {
-      const errText = await aiResponse.text();
-      throw new Error(errText || 'AI engine chat request failed');
-    }
+      if (!context) {
+        const hint = !sessionId ? 'sessionId is missing from the request' : 'session expired or not found';
+        res.status(400).json({ error: `No repository is currently active or ${hint}. Please analyze a repository first.` });
+        return;
+      }
+
+      const aiEngineUrl = process.env.AI_ENGINE_URL || 'http://localhost:8000';
+
+      try {
+        const baseUrl = aiEngineUrl.replace(/\/+$/, '');
+        const aiResponse = await fetchWithTimeout(`${baseUrl}/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            files: context.files,
+            message,
+            history,
+            model,
+            temperature,
+            maxTokens,
+            systemPrompt,
+            useRag,
+            repo_url: context.repoUrl
+          })
+        }, 30000);
+
+        if (aiResponse.ok) {
+          const data = await aiResponse.json();
+          res.json(data);
+        } else {
+          const errText = await aiResponse.text();
+          throw new Error(errText || 'AI engine chat request failed');
+        }
+      } catch (err) {
+        console.error('❌ Chat API Error:', err.message);
+        
+        // Simple local fallback if Python FastAPI server is offline
+        const responseMessage = `[Fallback Response] I see you are asking about: "${message}". Currently, the FastAPI AI Engine is offline, so I cannot analyze the full codebase for your query. Please make sure the AI Engine service is running on port 8000.`;
+        res.json({ response: responseMessage, sessionId, _mock: true, _mockWarning: 'AI Engine unavailable. Fallback response generated.' });
+      }
+    });
   } catch (err) {
-    console.error('❌ Chat API Error:', err.message);
-    
-    // Simple local fallback if Python FastAPI server is offline
-    const responseMessage = `[Fallback Response] I see you are asking about: "${message}". Currently, the FastAPI AI Engine is offline, so I cannot analyze the full codebase for your query. Please make sure the AI Engine service is running on port 8000.`;
-    return res.json({ response: responseMessage, sessionId, _mock: true, _mockWarning: 'AI Engine unavailable. Fallback response generated.' });
+    console.error('❌ Chat serialization error:', err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'An internal error occurred while processing your message.' });
+    }
   }
 });
 
