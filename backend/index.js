@@ -713,7 +713,16 @@ app.post('/api/webhook', async (req, res) => {
       console.log(`📡 GitHub Webhook received: PR #${pullNumber} ${action} (${headSha.substring(0,7)}) in ${owner}/${repo}`);
       
       reviewQueue.enqueue(reviewKey, { owner, repo, pullNumber, headSha }, async (item) => {
-        await runWebhookReview(item.owner, item.repo, item.pullNumber, item.headSha);
+        try {
+          await runWebhookReview(item.owner, item.repo, item.pullNumber, item.headSha);
+        } catch (error) {
+          const set = reviewedShas.get(shaKey);
+          if (set) {
+            set.delete(headSha);
+            if (set.size === 0) reviewedShas.delete(shaKey);
+          }
+          throw error;
+        }
       });
     }
   }
